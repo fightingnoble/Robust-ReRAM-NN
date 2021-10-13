@@ -10,7 +10,11 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            // "args": ["configs/vgg/vgg11_b32x8_imagenet.py", "checkpoints/vgg11_batch256_imagenet_20210208-4271cd6c.pth", "--metrics=accuracy", "--metric-options=topk=1"]
+            "args": ["configs/lenet/lenet5_mnist.py", "checkpoints/lenet/epoch_5.pth", 
+                "--metrics=accuracy", "--metric-options=topk=1", 
+                "--w_bits", "4", "--enable-noise", "--random-ite", "20"]
         }
     ]
 }

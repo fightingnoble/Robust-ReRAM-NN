@@ -32,7 +32,7 @@ class Quantizer(nn.Module):
     def __init__(self):
         super().__init__()
         self.calibration = False
-        self.calibrated = False
+        self.calibrated = None
 
     # def quantize(self, input, interval, max_int, min_int, *args, **kwargs):
     #     return input

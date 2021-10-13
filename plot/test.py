@@ -11,7 +11,7 @@ from module.layer_q import crxb_Conv2d
 from module.quantization.layer_quantizer import RobustCrxbQuantizer
 
 crxb_cfg = {'gmax': 0.000333, 'gmin': 3.33e-07, 'gwire': 0.0357, 'gload': 0.25, 'q_type': 'robust_batch',
-            'input_qbit': 8, 'weight_qbit': 8, 'activation_qbit': 8, 'vdd': 3.3, 'freq': 10000000.0, 'temp': 300,
+            'input_qbit': 8, 'weight_qbit': 8, 'inter_activation_qbit': 8, 'vdd': 3.3, 'freq': 10000000.0, 'temp': 300,
             'crxb_size': 64, 'enable_SAF': False, 'enable_ec_SAF': False, 'enable_noise': False, 'noise_amp': 0.12,
             'random_noise': True, 'ir_drop': False, 'device': 'cuda', 'enable_ec_Var': False, 'p_fix': 0.1}
 
@@ -53,7 +53,7 @@ if __name__ == "__main__":
                 model_dict[k].copy_(pretrained_dict[k].data)
         model_out.mode = "calibration_forward"
         model_out(calibration_inputs)
-        model_out.mode = "quant_forward"
+        model_out.mode = "qat_forward"
 
     model_conversion(conv_torch, conv_crxb, feature)
     ref_o = conv_torch(feature)

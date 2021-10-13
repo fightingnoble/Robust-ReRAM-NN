@@ -517,7 +517,7 @@ def time_measurement(distributed, rank, ngpus_per_node):
             m, s = divmod(s, 60)
             h, m = divmod(m, 60)
             if not distributed or (distributed and rank % ngpus_per_node == 0):
-                print("%d:%02d:%02d:%03d" % (h, m, s, ms))
+                print("%d:%02d:%02d:%03d\n" % (h, m, s, ms))
             return output
 
         return wrapped_function

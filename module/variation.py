@@ -19,16 +19,15 @@ import torch.nn as nn
 
 class Variation(nn.Module):
 
-    def __init__(self, G_shape, noise_amp=0.12, random_noise=True, noise_mean=None, noise_var=None):
+    def __init__(self, G_shape, noise_amp_var=0.5, random_noise=True, noise_mean=None):
         super(Variation, self).__init__()
         '''
         This module performs the Var (variation) non-ideal effect injection.
             Args:
                 G_shape (tensor.size): crossbar array size.
-                noise_mean (float): noise mean for gaussian distribution 
-                noise_var (float): noise variance for gaussian distribution
-                noise_amp (float): noise amplitude for determined noise
                 random_noise (float): whether use noise distribution
+                noise_amp_var (float): noise variance for gaussian distribution
+                noise_mean (float): noise mean for gaussian distribution 
         '''
 
         # initialize a random mask
@@ -36,7 +35,7 @@ class Variation(nn.Module):
         # state on-the-fly, for simulation speedup. However the current setup has higher configurability
         # to simulate the real-time variation state if there is run-time change .
         self.register_buffer('p_state', torch.empty(G_shape))
-        self.update_variation_profile(noise_amp, random_noise, noise_mean, noise_var)  # init the variation distribution profile
+        self.update_variation_profile(random_noise, noise_amp_var, noise_mean)  # init the variation distribution profile
 
     def forward(self, input):
         '''
@@ -46,21 +45,15 @@ class Variation(nn.Module):
         output = Inject_variation(input, self.p_state)
         return output
 
-    def update_variation_profile(self, noise_amp, random_noise, noise_mean, noise_var, dist='normal'):
+    def update_variation_profile(self, random_noise, noise_amp_var, noise_mean=0., dist='normal'):
         if random_noise:
             if dist == 'normal':
-                if noise_mean is not None and noise_var is not None:
-                    self.p_state.data.normal_(noise_mean, noise_var**2)
+                    self.p_state.data.normal_(noise_mean, noise_amp_var**2)
                     # 20210313: add: clip the noise to avoid extreme condition
-                    # self.p_state.clamp_(noise_mean-noise_var*3,noise_mean+noise_var*3)
-                else:
-                    self.p_state.data.normal_(0, abs(noise_amp / 3))
-                    # 20210313: add: clip the noise to avoid extreme condition
-                    # self.p_state.clamp_(-noise_amp,noise_amp)
-
+                    # self.p_state.clamp_(noise_mean-noise_amp_var*3,noise_mean+noise_amp_var*3)
         else:
-            self.p_state.data[0].fill_(noise_amp)
-            self.p_state.data[0].fill_(-noise_amp)
+            self.p_state.data[0].fill_(noise_amp_var)
+            self.p_state.data[1].fill_(-noise_amp_var)
         return
 
 

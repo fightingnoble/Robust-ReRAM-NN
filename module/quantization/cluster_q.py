@@ -24,6 +24,12 @@ class ClusterQuantizerBase(Quantizer):
         self.register_buffer("cluster_centers_", torch.zeros(n_clusters, n_feature))
         self.quant_fun = quant_fun
 
+    def reset(self):
+        super().reset()
+        # self.labels_.zero_()
+        self.register_buffer("labels_", torch.zeros((0, ),dtype=torch.long))
+        self.cluster_centers_.data.copy_(torch.linspace(-1, 1, steps=self.n_clusters).view(-1, 1))
+
     def forward(self, inputs):
         output = self.quant_func(inputs)
         return output
@@ -50,7 +56,7 @@ class ClusterQuantizerBase(Quantizer):
                     net(inp)
         for name,module in wrapped_modules.items():
             print(f"{name}: {module.quantizer}")
-            module.mode='quant_forward'
+            module.mode='qat_forward'
         print("calibration finished")
 
 
@@ -74,6 +80,17 @@ class RobustqTorch(ClusterQuantizerBase):
         # self.init_layer_cluster_center(data, n_clusters, q_level_init)
         self.init_layer_cluster_center(None, n_clusters, q_level_init)
 
+    def init_layer_cluster_center(self, data, n_clusters, method="uniform"):
+        if method == "uniform" or data is None:
+            self.cluster_centers_.data.copy_(torch.linspace(-1, 1, steps=n_clusters).view(-1, 1))
+            self.kmeans.cluster_centers_ = self.cluster_centers_.data.cpu().numpy()
+        else:
+            self.fit(data, tol=1e-2)
+
+    def reset(self):
+        super().reset()
+        self.kmeans.cluster_centers_ = self.cluster_centers_.data.cpu().numpy()
+
     def fit(self, X: torch.Tensor, y=None, sample_weight=None, n_init=None, init=None, tol=None):
         # 210626 data copy optimization
         # data = X.detach().clone().view(-1, 1)
@@ -86,7 +103,7 @@ class RobustqTorch(ClusterQuantizerBase):
                                                                  for new, old in zip((n_init, init, tol), bak)]
         self.kmeans.fit(data, y=y, sample_weight=sample_weight, var_std=self.alpha, var_weight=self.gamma)
         # self.labels_.data.copy_(torch.from_numpy(self.kmeans.labels_))
-        self.register_buffer("labels_", torch.from_numpy(self.kmeans.labels_))
+        self.register_buffer("labels_", torch.as_tensor(self.kmeans.labels_,dtype=torch.long))
         self.cluster_centers_.data.copy_(torch.from_numpy(self.kmeans.cluster_centers_))
         self.kmeans.n_init, self.kmeans.init, self.kmeans.tol = bak
 
@@ -119,13 +136,6 @@ class RobustqTorch(ClusterQuantizerBase):
         data = data.cpu().numpy()
         return self.kmeans.predict(data, sample_weight, var_std=self.alpha, var_weight=self.gamma)
 
-    def init_layer_cluster_center(self, data, n_clusters, method="uniform"):
-        if method == "uniform" or data is None:
-            self.cluster_centers_.data.copy_(torch.linspace(-1, 1, steps=n_clusters).view(-1, 1))
-            self.kmeans.cluster_centers_ = self.cluster_centers_.data.cpu().numpy()
-        else:
-            self.fit(data, tol=1e-2)
-
     def forward(self, inputs):
 
         # To avoid fault fitness in initial iterations
@@ -133,7 +143,11 @@ class RobustqTorch(ClusterQuantizerBase):
         #     # use uniform quantization to avoid further fitness with bad data
         #     self.init_layer_cluster_center(inputs, self.weight_qbit)
         
-        if self.training or self.calibration:
+        if self.calibration and not self.calibrated:
+            self.fit(inputs) 
+            labels = self.labels_
+            weight_quan = self.cluster_centers_[:, 0][labels].view(inputs.shape)
+        elif self.training:
             # label should change as weights are updated
             labels = self.predict(inputs)
             weight_quan_temp = self.cluster_centers_[:, 0][labels].view(inputs.shape)
@@ -155,13 +169,15 @@ class RobustqTorch(ClusterQuantizerBase):
 
 class MiniBatchRobustqTorch(RobustqTorch):
         
-    def __init__(self, # data_or_size, 
+    def __init__(self, # batch_size, # data_or_size, 
                  n_feature=1, n_clusters=8, name='',
                  alpha=0.1, gamma=1.0, q_level_init='uniform', **kwargs):
+        if "batch_size" in kwargs:
+            kwargs.pop("batch_size")
         super().__init__(n_feature=n_feature, n_clusters=n_clusters, name=name, 
                          alpha=alpha, gamma=gamma, q_level_init=q_level_init, **kwargs)
 
-        self.kmeans = MiniBatchRobustQ(n_clusters=n_clusters, **kwargs)
+        self.kmeans = MiniBatchRobustQ(n_clusters=n_clusters,**kwargs)
         # if hasattr(data_or_size, '__array__'):
         #     data = data_or_size
         # else:
@@ -201,7 +217,7 @@ class MiniBatchRobustqTorch(RobustqTorch):
         data = data.cpu().numpy()
         self.kmeans.partial_fit(data, y, sample_weight, var_std=self.alpha, var_weight=self.gamma)
         # self.labels_.data.copy_(torch.from_numpy(self.kmeans.labels_))
-        self.register_buffer("labels_", torch.from_numpy(self.kmeans.labels_))
+        self.register_buffer("labels_", torch.as_tensor(self.kmeans.labels_,dtype=torch.long))
         self.cluster_centers_.data.copy_(torch.from_numpy(self.kmeans.cluster_centers_))
 
     def extra_repr(self) -> str:
@@ -254,7 +270,7 @@ if __name__ == '__main__':
     # if torch.cuda.is_available():
     #     vgg.cuda()
     # a['state_dict'] = vgg.state_dict()
-    a = torch.load("/root/cifar10_vgg8_SGD_StepLR_model_best.pth.tar",
+    a = torch.load("plot/checkpoints/resnet18_batch256_imagenet_20200708-34ab8f90.pth",
                    map_location=torch.device('cpu') if not torch.cuda.is_available() else torch.device('cuda'))
     num_class = 7
     batch_factor = 800
@@ -290,7 +306,7 @@ if __name__ == '__main__':
                                                              if num_class * batch_factor < int(0.3 * n_samples)
                                                              else int(0.2 * n_samples)))
                 # from clusterq
-                robustq_torch_batch_t = MiniBatchRobustqTorch(data_or_size=v, n_feature=1,
+                robustq_torch_batch_t = MiniBatchRobustqTorch(n_feature=1,
                                                               n_clusters=num_class,
                                                               alpha=0.12, gamma=gamma,
                                                               batch_size=num_class * batch_factor
@@ -301,7 +317,7 @@ if __name__ == '__main__':
                                                               )
                 if not train_flg:
                     robustq_torch_batch_t.eval()
-                robustq_torch_t = RobustqTorch(data_or_size=v, n_feature=1,
+                robustq_torch_t = RobustqTorch(n_feature=1,
                                                n_clusters=num_class,
                                                alpha=0.12, gamma=gamma,
                                                n_init=1, max_iter=30, random_state=0,
@@ -341,12 +357,12 @@ if __name__ == '__main__':
                         datac = data_o.cpu().numpy()
                         t = (datac != data)
                         tt = t if not isinstance(t, np.ndarray) else t.any()
-                        print("data is modified:", tt)
+                        # print("data is modified:", tt)
                     else:
                         datac = data_o.cuda()
                         t = (datac != data)
                         tt = t.any().item()
-                        print("data is modified:", tt)
+                        # print("data is modified:", tt)
 
                     if tt:
                         print("max difference:", ((datac - data_o)[t]).max())
@@ -593,7 +609,7 @@ if __name__ == '__main__':
                 sf = bits - 1. - compute_integral_part(w, overflow_rate=0)
                 q2 = linear_quantize(w, sf, bits=bits)
                 q2_list.append(q2)
-                q2_loss += (q2 - w).norm()
+                q2_loss += ((q2 - w)**2).sum()
                 ix += 1
     print(q2_loss)
     # vis.histogram(q2_list[0].view(-1), win='uniform'+" hist",

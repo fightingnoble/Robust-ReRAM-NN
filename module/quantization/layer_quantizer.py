@@ -24,7 +24,7 @@ class LayerQuantizer(nn.Module):
         self.bias_bit=bias_bit
         self.n_calibration_steps=1
         self.calibration_step=1
-        self.calibrated=False
+        self.calibrated=None
         self.input_process=None
         self.output_process=None
         self.weight_dynamic_process=None
@@ -36,7 +36,15 @@ class LayerQuantizer(nn.Module):
         self.bias_interval=None
         self.output_interval=None
         self.bias_offset=None
-        
+
+    def reset(self):
+        self.calibrated=None
+        self.weight_interval=None
+        self.input_interval=None
+        self.bias_interval=None
+        self.output_interval=None
+        self.bias_offset=None
+
     def quant_weight(self,weight,weight_interval=None):
         if weight_interval is None:
             weight_interval=self.weight_interval
@@ -112,7 +120,7 @@ class LayerQuantizer(nn.Module):
                     net(inp)
         for name,module in wrapped_modules.items():
             print(f"{name}: {module.quantizer}")
-            module.mode='quant_forward'
+            module.mode='qat_forward'
         print("calibration finished")
 
 
@@ -129,6 +137,12 @@ class SimpleCrxbQuantizer(LayerQuantizer):
         self.o_quantizer = AverageLinearSignSymmIntervalQuantizer(self.ia_bit)
         self.i_quantizer = AverageLinearSignSymmIntervalQuantizerIntO(self.a_bit)
         self.w_quantizer = UniformQ(self.w_bit)
+
+    def reset(self):
+        super().reset()
+        self.o_quantizer.reset()
+        self.i_quantizer.reset()
+        self.w_quantizer.reset()
 
     def quant_input(self, tensor):
         return self.i_quantizer(tensor)
@@ -162,16 +176,26 @@ class SimpleCrxbQuantizer(LayerQuantizer):
     def calibration(self, x, weight, bias, op) -> Tensor:
         self.i_quantizer.calibration=True
         self.o_quantizer.calibration=True
+        self.w_quantizer.calibration=True
         x_sim=self.quant_input(x)
 
         w_sim=self.quant_weight(weight)
+        # self.w_quantizer.calibrated=True
         output_crxb = op(x_sim, w_sim)
+
+        # !!! Debug 3 days!!!
+        # self.w_quantizer.calibration=False
+        # self.i_quantizer.calibration=False
+        # self.o_quantizer.calibration=False
+        # self.calibrated = True
+        # return self.o_quantizer(output_crxb), x_sim, w_sim
 
         self.w_quantizer.calibration=False
         self.i_quantizer.calibration=False
+        out_sim = self.o_quantizer(output_crxb)
         self.o_quantizer.calibration=False
         self.calibrated = True
-        return self.o_quantizer(output_crxb), x_sim, w_sim
+        return out_sim, x_sim, w_sim
 
 
 class RobustCrxbQuantizer(SimpleCrxbQuantizer):
@@ -179,6 +203,43 @@ class RobustCrxbQuantizer(SimpleCrxbQuantizer):
         super().__init__(w_bit, a_bit, bias_bit, ia_bit=ia_bit)
         n_clusters = 2 ** self.w_bit - 1
         self.w_quantizer = RobustqTorch(n_feature=1,
+                                        n_clusters=n_clusters,
+                                        alpha=alpha, gamma=gamma,
+                                        n_init=1, max_iter=30, random_state=0,
+                                        q_level_init="uniform"
+                                        )
+
+    def calibration(self, x, weight, bias, op) -> Tensor:
+        self.i_quantizer.calibration=True
+        self.o_quantizer.calibration=True
+        self.w_quantizer.calibration=True
+        x_sim=self.quant_input(x)
+
+        w_sim=self.quant_weight(weight)
+        self.w_quantizer.calibrated = True
+
+        output_crxb = op(x_sim, w_sim)
+
+        # !!! Debug 3 days!!!
+        # self.w_quantizer.calibration=False
+        # self.i_quantizer.calibration=False
+        # self.o_quantizer.calibration=False
+        # self.calibrated = True
+        # return self.o_quantizer(output_crxb), x_sim, w_sim
+
+        self.w_quantizer.calibration=False
+        self.i_quantizer.calibration=False
+        out_sim = self.o_quantizer(output_crxb)
+        self.o_quantizer.calibration=False
+        self.calibrated = True
+        return out_sim, x_sim, w_sim
+
+
+class MinibatchRobustCrxbQuantizer(RobustCrxbQuantizer):
+    def __init__(self, w_bit, a_bit, bias_bit, alpha=0.1, gamma=1.0, ia_bit=None) -> None:
+        super().__init__(w_bit, a_bit, bias_bit, ia_bit=ia_bit)
+        n_clusters = 2 ** self.w_bit - 1
+        self.w_quantizer = MiniBatchRobustqTorch(n_feature=1,
                                         n_clusters=n_clusters,
                                         alpha=alpha, gamma=gamma,
                                         n_init=1, max_iter=30, random_state=0,
@@ -226,8 +287,10 @@ class EasyquantCrxbQuantizer(SimpleCrxbQuantizer):
             # print(f"Debug x.mean()={x.mean()} x.max()={x.max()} weight.mean()={weight.mean()} weight.max()={weight.max()}")
             for i in range(self.eq_n):
                 now_interval=(self.eq_alpha+i/self.eq_n*(self.eq_beta-self.eq_alpha))*init_interval
+
                 max_value=2**(self.w_bit-1)
                 w_int=torch.round_(weight/(now_interval)).clamp(-max_value,max_value-1)
+
                 w_sim=w_int*now_interval
                 output_sim=op(x,w_sim,bias)
                 # TODO: bias quantization
@@ -259,13 +322,16 @@ class EasyquantCrxbQuantizer(SimpleCrxbQuantizer):
             
             interval_candidates=(self.eq_alpha+torch.arange(self.eq_n,device=init_interval.device)/self.eq_n*(self.eq_beta-self.eq_alpha))*init_interval.view(1)
             interval_candidates=interval_candidates.view(self.eq_n,1,1,1,1)
+
             max_value=2**(self.a_bit-1)
             raw_out=raw_out.view(1,-1)
             similarities=[]
             for i_st in range(0,len(interval_candidates),parallel_cadidates):
                 # print("parallel_cadidates",parallel_cadidates,'i_st',i_st)
                 part_candidates=interval_candidates[i_st:i_st+parallel_cadidates]
+
                 x_sim=torch.round_(x.view(1,batch_size,ic,ih,iw)/part_candidates).clamp_(-max_value,max_value-1).mul_(part_candidates) #shape #parallel batchsize ic ih iw
+
                 out_sim=op(x_sim.view(-1,ic,ih,iw),w_sim,b_sim).view(-1,batch_size*oc*oh*ow)
                 if self.metric=='cos_sim':
                     output_sim_norm=torch.norm(out_sim,1)
@@ -280,6 +346,7 @@ class EasyquantCrxbQuantizer(SimpleCrxbQuantizer):
             similarities=torch.cat(similarities) # shape eq_n
             max_ind=torch.argmax(similarities)
             best_input_interval=interval_candidates[max_ind].view(1)
+
             best_input_sim=torch.round_(x/best_input_interval).clamp_(-max_value,max_value-1).mul_(best_input_interval)
             del w_sim,b_sim,max_ind,similarities
             return best_input_interval.detach(),best_input_sim.detach()
@@ -369,6 +436,7 @@ class EasyquantCrxbQuantizer(SimpleCrxbQuantizer):
             del w_sim,b_sim,raw_out
             return out
 
+
 def search_tensor_best_quant_interval(tensor,raw_tensor,interval_candidates,bitwidth,metric='cos_sim', asymmetric=False, visualize=False):
     best_interval=None
     best_tensor_sim=None
@@ -402,6 +470,7 @@ def search_tensor_best_quant_interval(tensor,raw_tensor,interval_candidates,bitw
             best_tensor_sim=tensor_q_sim
     return best_interval.detach(),best_tensor_sim.detach()
 
+
 def channelwise_search_tensor_best_quant_interval(tensor,raw_tensor,interval_candidates,bitwidth,metric='cos_sim'):
     """
     interval_candidates: shape [n_candidates,1,c,1,1]
@@ -414,8 +483,10 @@ def channelwise_search_tensor_best_quant_interval(tensor,raw_tensor,interval_can
     for candidate_i in range(len(interval_candidates)):
         interval=interval_candidates[candidate_i] #shape [1,c,1,1]
         # print(interval.size(),tensor.size())
+
         tensor_int=torch.round_(tensor/(interval)).clamp(-max_value,max_value-1)
         tensor_sim=tensor_int*interval
+
         if metric=='cos_sim':
             similarity=torch.mean(torch.sum(tensor_sim*raw_tensor,[2,3])/(torch.norm(tensor_sim,dim=[2,3])*torch.norm(raw_tensor,dim=[2,3])),0) # shape c
         elif metric=='mse':
@@ -447,6 +518,7 @@ def channelwise_search_weight_best_quant_interval(input,op,weight,bias,raw_outpu
         best_weight_intervals=torch.zeros(oc,1,1,1).to(input.device)
         for candidate_i in range(len(interval_candidates)):
             interval=interval_candidates[candidate_i]
+
             w_int=torch.round_(weight/(interval)).clamp(-max_value,max_value-1)
             w_sim=w_int*interval
             out_sim=op(input,w_sim,bias)
